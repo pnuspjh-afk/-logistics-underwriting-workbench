@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+*$py.class
+.venv
+venv/
+ENV/
+.env
+.streamlit/
+.DS_Store
+*.swp
+test_logic.py

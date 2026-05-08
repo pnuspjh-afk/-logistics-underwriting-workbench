@@ -1,0 +1,4 @@
+asset_name,location,purchase_price,leasable_area_sqm,annual_rent_per_sqm,vacancy_rate,opex_ratio,annual_opex,annual_capex,ltv,interest_rate,hold_period_years,exit_cap_rate,tenant_concentration
+인천 서구 물류센터 A,인천 서구,50000000000,20000,120000,0.05,0.25,0,200000000,0.60,0.045,5,0.055,0.40
+부산 강서구 물류센터 B,부산 강서구,30000000000,15000,100000,0.15,0.30,0,300000000,0.65,0.05,7,0.060,0.60
+경기 이천 콜드체인 물류센터 C,경기도 이천,80000000000,25000,150000,0.03,0.28,0,500000000,0.55,0.042,5,0.050,0.35

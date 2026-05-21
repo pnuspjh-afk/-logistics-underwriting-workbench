@@ -1,7 +1,8 @@
 import copy
+import math
 from typing import Dict, List, Optional, Union
 
-# IRR 계산을 위한 numpy_financial 시도, 없을 경우 fallback logic 사용
+# IRR 계산을 위한 numpy_financial 시도
 try:
     import numpy_financial as npf
 except ImportError:
@@ -14,14 +15,14 @@ def validate_inputs(inputs: Dict) -> Dict:
     """
     validated = copy.deepcopy(inputs)
     
-    # 필수 필드 체크 및 0/음수 방지
+    # 필수 수치 필드 리스트
     numeric_fields = [
         'purchase_price', 'leasable_area_sqm', 'annual_rent_per_sqm',
         'ltv', 'interest_rate', 'hold_period_years', 'exit_cap_rate'
     ]
     
     for field in numeric_fields:
-        if field not in validated:
+        if field not in validated or validated[field] is None:
             validated[field] = 0.0
             
     # 비율 데이터 보정 (0~1 범위 권장)
@@ -33,38 +34,54 @@ def validate_inputs(inputs: Dict) -> Dict:
 
 def compute_noi(inputs: Dict) -> Dict:
     """
-    Rent 및 NOI(순영업소득)를 계산합니다.
+    임대수익 및 상세 운영비용(Opex)을 반영하여 NOI를 산출합니다.
     """
     gri = inputs['leasable_area_sqm'] * inputs['annual_rent_per_sqm']
     egi = gri * (1 - inputs['vacancy_rate'])
     
-    # Opex: 직접 입력값이 있으면 우선 사용, 없으면 EGI 대비 비율로 계산
+    # 1. 재산세: 매입가 대비 요율
+    property_tax = inputs.get('property_tax_ratio', 0.0015) * inputs['purchase_price']
+    
+    # 2. 보험료 및 PM 수수료: 면적당 단가
+    insurance_pm = inputs.get('opex_per_sqm', 3000) * inputs['leasable_area_sqm']
+    
+    # 3. 기타 운영비: EGI 대비 요율
+    other_opex = inputs.get('other_opex_ratio', 0.02) * egi
+    
+    total_opex = property_tax + insurance_pm + other_opex
+    
+    # 하위 호환성 및 수기 입력 대응
     if inputs.get('annual_opex', 0) > 0:
-        opex = inputs['annual_opex']
-    else:
-        opex = egi * inputs['opex_ratio']
+        total_opex = inputs['annual_opex']
+    elif inputs.get('opex_ratio', 0) > 0 and (property_tax + insurance_pm + other_opex) == 0:
+        total_opex = egi * inputs['opex_ratio']
         
-    noi = egi - opex - inputs.get('annual_capex', 0)
+    noi = egi - total_opex - inputs.get('annual_capex', 0)
     
     return {
         "gri": round(gri, 2),
         "egi": round(egi, 2),
-        "opex": round(opex, 2),
+        "property_tax": round(property_tax, 2),
+        "insurance_pm": round(insurance_pm, 2),
+        "other_opex": round(other_opex, 2),
+        "total_opex": round(total_opex, 2),
         "noi": round(noi, 2)
     }
 
 
 def compute_debt_metrics(inputs: Dict, noi: float) -> Dict:
     """
-    LTV 및 DSCR 등 대출 관련 지표를 계산합니다.
+    대출 관련 지표(LTV, DSCR)를 산출합니다.
     """
     loan_amount = inputs['purchase_price'] * inputs['ltv']
-    # MVP: 만기일시상환(Interest-only) 가정
+    # Interest-only (만기일시상환) 가정
     annual_debt_service = loan_amount * inputs['interest_rate']
     
     dscr = None
     if annual_debt_service > 0:
         dscr = round(noi / annual_debt_service, 2)
+    elif noi > 0:
+        dscr = 99.9  # 무부채 시 매우 높은 값으로 처리
         
     ltv_effective = round(loan_amount / inputs['purchase_price'], 4) if inputs['purchase_price'] > 0 else 0
     
@@ -78,55 +95,64 @@ def compute_debt_metrics(inputs: Dict, noi: float) -> Dict:
 
 def _calculate_irr(cash_flows: List[float]) -> Optional[float]:
     """
-    캐시플로우 리스트로부터 IRR을 계산합니다.
+    Cash Flow 시리즈로부터 IRR을 계산합니다. 계산 불가 시 None을 반환합니다.
     """
-    if not cash_flows:
+    if not cash_flows or len(cash_flows) < 2:
         return None
         
     if npf:
         try:
-            return float(npf.irr(cash_flows))
+            val = float(npf.irr(cash_flows))
+            return val if not math.isnan(val) else None
         except Exception:
             return None
     
-    # Fallback: 단순 Newton-Raphson (매우 단순화된 버전)
-    # 실제 환경에서는 numpy_financial 설치를 강력 권장함
     return None 
 
 
 def compute_exit_and_irr(inputs: Dict, noi: float, annual_debt_service: float) -> Dict:
     """
-    Exit 가치 및 Equity IRR을 계산합니다.
+    매각 가치, 배당수익률(CoC), 자본배율(EM), IRR을 산출합니다.
     """
-    # Exit Value 계산 (Cap Rate 방식)
+    # 1. Exit Value (Cap Rate 기준)
     exit_cap = inputs['exit_cap_rate']
     exit_value = (noi / exit_cap) if exit_cap > 0 else 0
     
+    # 2. Entry Cap Rate
+    entry_cap = (noi / inputs['purchase_price']) if inputs['purchase_price'] > 0 else 0
+    
+    # 3. Capital Stack
     loan_amount = inputs['purchase_price'] * inputs['ltv']
     equity_initial = inputs['purchase_price'] - loan_amount
     
-    # 연간 현금흐름 (Cash Flow after Debt Service)
+    # 4. Cash Flows
     cf_annual = noi - annual_debt_service
-    
-    # 매각 시점 현금흐름 (Sale Proceeds)
-    # exit_value에서 대출 원금을 상환한 잔액
     sale_proceeds = exit_value - loan_amount
     
-    # 전체 현금흐름 시계열 생성
     hold_years = int(inputs['hold_period_years'])
-    cash_flows = [-equity_initial]  # Year 0
+    cash_flows = [-equity_initial]  # Year 0: Equity Out
     
+    total_inflow = 0
     for year in range(1, hold_years):
         cash_flows.append(cf_annual)  # Year 1 ~ n-1
+        total_inflow += cf_annual
         
     # Year n: 운영수익 + 매각수익
-    cash_flows.append(cf_annual + sale_proceeds)
+    final_cf = cf_annual + sale_proceeds
+    cash_flows.append(final_cf)
+    total_inflow += final_cf
     
+    # 5. Metrics
+    coc = (cf_annual / equity_initial) if equity_initial > 0 else 0
+    em = (total_inflow / equity_initial) if equity_initial > 0 else 0
     irr = _calculate_irr(cash_flows)
     
     return {
         "exit_value": round(exit_value, 2),
+        "entry_cap": round(entry_cap, 4),
         "equity": round(equity_initial, 2),
+        "coc": round(coc, 4),
+        "em": round(em, 2),
         "cash_flow_series": cash_flows,
         "equity_irr": round(irr, 4) if irr is not None else None
     }
@@ -134,7 +160,7 @@ def compute_exit_and_irr(inputs: Dict, noi: float, annual_debt_service: float) -
 
 def run_underwriting(inputs: Dict) -> Dict:
     """
-    전체 언더라이팅 프로세스를 실행하고 결과를 구조화하여 반환합니다.
+    전체 언더라이팅 로직을 순차적으로 실행하여 종합 결과를 반환합니다.
     """
     val_inputs = validate_inputs(inputs)
     
@@ -151,8 +177,11 @@ def run_underwriting(inputs: Dict) -> Dict:
             "noi": rent_block['noi'],
             "dscr": debt_block['dscr'],
             "ltv": debt_block['ltv_effective'],
+            "entry_cap": exit_block['entry_cap'],
             "exit_value": exit_block['exit_value'],
-            "equity_irr": exit_block['equity_irr']
+            "equity_irr": exit_block['equity_irr'],
+            "coc": exit_block['coc'],
+            "em": exit_block['em']
         }
     }
 
